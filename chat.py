@@ -1,302 +1,234 @@
 #!/usr/bin/env python3
+import getpass
 import os
-import sys
 import json
-from datetime import datetime
+from typing import List, Literal, Optional
+import uuid
+from typing_extensions import TypedDict
 from dotenv import load_dotenv
+
+import tiktoken
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+from langchain_core.messages import get_buffer_string
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
+from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_core.chat_history import InMemoryChatMessageHistory
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_openai.embeddings import OpenAIEmbeddings
+from langchain_tavily import TavilySearch
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode
 
-MEMORY_DIR = "memory"
-CONVERSATION_FILE = os.path.join(MEMORY_DIR, "conversation_history.json")
-USER_PROFILE_FILE = os.path.join(MEMORY_DIR, "user_profile.json")
+load_dotenv()
 
-def ensure_memory_directory():
-    if not os.path.exists(MEMORY_DIR):
-        os.makedirs(MEMORY_DIR)
+def _set_env(var: str):
+    if not os.environ.get(var):
+        os.environ[var] = getpass.getpass(f"{var}: ")
 
-def save_conversation_history(messages):
-    ensure_memory_directory()
-    conversation_data = []
-    
-    for message in messages:
-        if isinstance(message, HumanMessage):
-            conversation_data.append({
-                "type": "human",
-                "content": message.content,
-                "timestamp": datetime.now().isoformat()
-            })
-        elif isinstance(message, AIMessage):
-            conversation_data.append({
-                "type": "ai", 
-                "content": message.content,
-                "timestamp": datetime.now().isoformat()
-            })
-    
-    try:
-        with open(CONVERSATION_FILE, 'w', encoding='utf-8') as f:
-            json.dump(conversation_data, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"Warning: Could not save conversation history: {e}")
+_set_env("OPENAI_API_KEY")
 
-def load_conversation_history():
-    if not os.path.exists(CONVERSATION_FILE):
-        return []
-    
-    try:
-        with open(CONVERSATION_FILE, 'r', encoding='utf-8') as f:
-            conversation_data = json.load(f)
-        
-        messages = []
-        for item in conversation_data:
-            if item["type"] == "human":
-                messages.append(HumanMessage(content=item["content"]))
-            elif item["type"] == "ai":
-                messages.append(AIMessage(content=item["content"]))
-        
-        return messages
-    except Exception as e:
-        print(f"Warning: Could not load conversation history: {e}")
-        return []
+recall_vector_store = InMemoryVectorStore(OpenAIEmbeddings(api_key=os.getenv("OPENAI_API_KEY")))
 
-def save_user_profile(profile_data):
-    """Save user profile information to JSON file"""
-    ensure_memory_directory()
-    
-    try:
-        existing_profile = {}
-        if os.path.exists(USER_PROFILE_FILE):
-            with open(USER_PROFILE_FILE, 'r', encoding='utf-8') as f:
-                existing_profile = json.load(f)
-        
-        # Merge new data with existing
-        existing_profile.update(profile_data)
-        existing_profile["last_updated"] = datetime.now().isoformat()
-        
-        with open(USER_PROFILE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(existing_profile, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"Warning: Could not save user profile: {e}")
 
-def load_user_profile():
-    """Load user profile information from JSON file"""
-    if not os.path.exists(USER_PROFILE_FILE):
-        return {}
-    
-    try:
-        with open(USER_PROFILE_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"Warning: Could not load user profile: {e}")
-        return {}
+def get_user_id(config: RunnableConfig) -> str:
+    user_id = config["configurable"].get("user_id")
+    if user_id is None:
+        raise ValueError("User ID needs to be provided to save a memory.")
 
-def extract_user_info(message_content):
-    """Extract user information from message content"""
-    content_lower = message_content.lower()
-    profile_updates = {}
-    
-    # Extract name
-    if "my name is" in content_lower or "i'm" in content_lower or "i am" in content_lower:
-        words = message_content.split()
-        for i, word in enumerate(words):
-            if word.lower() in ["is", "i'm", "am"] and i + 1 < len(words):
-                potential_name = words[i + 1].strip(".,!?")
-                if potential_name.isalpha() and len(potential_name) > 1:
-                    profile_updates["name"] = potential_name
-                    break
-    
-    # Extract age
-    if "i am" in content_lower and "years old" in content_lower:
-        import re
-        age_match = re.search(r'i am (\d+) years old', content_lower)
-        if age_match:
-            profile_updates["age"] = int(age_match.group(1))
-    
-    # Extract location
-    if "i live in" in content_lower or "from" in content_lower:
-        if "i live in" in content_lower:
-            location = content_lower.split("i live in")[1].split()[0].strip(".,!?")
-            if location:
-                profile_updates["location"] = location.title()
-        elif "from" in content_lower:
-            words = message_content.split()
-            from_index = next((i for i, word in enumerate(words) if word.lower() == "from"), -1)
-            if from_index != -1 and from_index + 1 < len(words):
-                location = words[from_index + 1].strip(".,!?")
-                if location.isalpha():
-                    profile_updates["location"] = location.title()
-    
-    return profile_updates
+    return user_id
 
-class PersistentChatMessageHistory(InMemoryChatMessageHistory):
-    """Custom chat history that persists to file"""
-    
-    def __init__(self):
-        super().__init__()
-        # Load existing messages
-        self.messages = load_conversation_history()
-    
-    def add_message(self, message):
-        super().add_message(message)
-        # Save after each message
-        save_conversation_history(self.messages)
-        
-        # Extract and save user information
-        if isinstance(message, HumanMessage):
-            user_info = extract_user_info(message.content)
-            if user_info:
-                save_user_profile(user_info)
-    
-    def clear(self):
-        super().clear()
-        # Clear persistent storage
-        if os.path.exists(CONVERSATION_FILE):
-            os.remove(CONVERSATION_FILE)
+class KnowledgeTriple(TypedDict):
+    subject: str
+    predicate: str
+    object_: str
 
-def load_api_key():
-    load_dotenv()
-    api_key = os.getenv('OPENAI_API_KEY')
-    
-    if not api_key:
-        print("Error: OPENAI_API_KEY not found in environment variables.")
-        sys.exit(1)
-    
-    return api_key
 
-def initialize_chat_chain(api_key):
-    try:
-        llm = ChatOpenAI(
-            api_key=api_key,
-            model="gpt-4o",
-            temperature=0.7,
-            max_tokens=1000
+@tool
+def save_recall_memory(memories: List[KnowledgeTriple], config: RunnableConfig) -> str:
+    """Save memory to vectorstore for later semantic retrieval."""
+    user_id = get_user_id(config)
+    for memory in memories:
+        serialized = " ".join(memory.values())
+        document = Document(
+            serialized,
+            id=str(uuid.uuid4()),
+            metadata={
+                "user_id": user_id,
+                **memory,
+            },
         )
-        
-        # Load user profile for context
-        user_profile = load_user_profile()
-        profile_context = ""
-        if user_profile:
-            # Format profile information without JSON to avoid template variable conflicts
-            profile_info = []
-            for key, value in user_profile.items():
-                if key != "last_updated":
-                    profile_info.append(f"{key}: {value}")
-            if profile_info:
-                profile_context = f"\n\nUser Profile Information:\n" + "\n".join(f"- {info}" for info in profile_info)
-        
-        # Create a prompt template with message history placeholder
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", f"You are a helpful assistant with persistent memory. You can remember our conversations across sessions and user information.{profile_context}\n\nBe concise and friendly in your responses. Reference previous conversations and user information when relevant."),
-            MessagesPlaceholder(variable_name="history"),
-            ("human", "{input}")
-        ])
-        
-        # Create the chain
-        chain = prompt | llm
-        
-        # Store for message history
-        store = {}
-        
-        def get_session_history(session_id: str) -> PersistentChatMessageHistory:
-            if session_id not in store:
-                store[session_id] = PersistentChatMessageHistory()
-            return store[session_id]
-        
-        # Create conversation with message history
-        conversation = RunnableWithMessageHistory(
-            chain,
-            get_session_history,
-            input_messages_key="input",
-            history_messages_key="history",
-        )
-        
-        return conversation, store
-    except Exception as e:
-        print(f"Error initializing LangChain conversation: {e}")
-        sys.exit(1)
+        recall_vector_store.add_documents([document])
+    return memories
 
-def main():
-    print("🧠 AI Chat with Persistent Memory")
-    print("📁 Your conversations and information are saved to 'memory/' folder")
-    print("Commands: 'quit', 'exit', 'bye' to exit | 'clear' to clear memory | 'memory' to see history | 'profile' to see your info")
-    print("-" * 80)
-    
-    api_key = load_api_key()
-    conversation, store = initialize_chat_chain(api_key)
-    session_id = "user_session"
-    
-    # Show loaded profile if exists
-    user_profile = load_user_profile()
-    if user_profile:
-        print(f"\n✅ Loaded your profile: {json.dumps(user_profile, indent=2)}")
-    
-    # Show conversation count
-    conversation_history = load_conversation_history()
-    if conversation_history:
-        print(f"📚 Loaded {len(conversation_history)} previous messages")
-    
-    while True:
-        try:
-            # Get user input
-            user_input = input("\n💬 You: ").strip()
-            
-            if not user_input:
-                continue
-            
-            if user_input.lower() in ['quit', 'exit', 'bye']:
-                print("\n👋 Goodbye! I'll remember our conversation for next time.")
-                break
-            
-            # Check for clear command
-            if user_input.lower() == 'clear':
-                if session_id in store:
-                    store[session_id].clear()
-                if os.path.exists(USER_PROFILE_FILE):
-                    os.remove(USER_PROFILE_FILE)
-                print("\n🧹 Memory cleared! All persistent data removed.")
-                continue
-            
-            # Check for profile command
-            if user_input.lower() == 'profile':
-                user_profile = load_user_profile()
-                if user_profile:
-                    print(f"\n👤 Your Profile:")
-                    for key, value in user_profile.items():
-                        if key != "last_updated":
-                            print(f"   {key.title()}: {value}")
-                    print(f"   Last Updated: {user_profile.get('last_updated', 'Unknown')}")
-                else:
-                    print("\n👤 No profile information saved yet.")
-                continue
-            
-            if user_input.lower() == 'memory':
-                print("\n📚 Conversation History:")
-                if session_id in store and store[session_id].messages:
-                    for message in store[session_id].messages:
-                        if isinstance(message, HumanMessage):
-                            print(f"👤 You: {message.content}")
-                        elif isinstance(message, AIMessage):
-                            print(f"🤖 AI: {message.content}")
-                else:
-                    print("No conversation history yet.")
-                continue
-            
-            print("\n🤖 AI: ", end="", flush=True)
-            ai_response = conversation.invoke(
-                {"input": user_input},
-                config={"configurable": {"session_id": session_id}}
-            )
-            print(ai_response.content)
-            
-        except KeyboardInterrupt:
-            print("\n\n👋 Goodbye! I'll remember our conversation for next time.")
-            break
-        except Exception as e:
-            print(f"\n❌ Unexpected error: {e}")
-            print("The conversation continues, but this message wasn't processed.")
 
-if __name__ == "__main__":
-    main() 
+@tool
+def search_recall_memories(query: str, config: RunnableConfig) -> List[str]:
+    """Search for relevant memories."""
+    user_id = get_user_id(config)
+
+    def _filter_function(doc: Document) -> bool:
+        return doc.metadata.get("user_id") == user_id
+
+    documents = recall_vector_store.similarity_search(
+        query, k=3, filter=_filter_function
+    )
+    return [document.page_content for document in documents]
+
+tools = [save_recall_memory, search_recall_memories]
+
+class State(MessagesState):
+    recall_memories: List[str]
+
+# Define the prompt template for the agent
+prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a helpful assistant with advanced long-term memory"
+            " capabilities. Powered by a stateless LLM, you must rely on"
+            " external memory to store information between conversations."
+            " Utilize the available memory tools to store and retrieve"
+            " important details that will help you better attend to the user's"
+            " needs and understand their context.\n\n"
+            "Memory Usage Guidelines:\n"
+            "1. Actively use memory tools (save_core_memory, save_recall_memory)"
+            " to build a comprehensive understanding of the user.\n"
+            "2. Make informed suppositions and extrapolations based on stored"
+            " memories.\n"
+            "3. Regularly reflect on past interactions to identify patterns and"
+            " preferences.\n"
+            "4. Update your mental model of the user with each new piece of"
+            " information.\n"
+            "5. Cross-reference new information with existing memories for"
+            " consistency.\n"
+            "6. Prioritize storing emotional context and personal values"
+            " alongside facts.\n"
+            "7. Use memory to anticipate needs and tailor responses to the"
+            " user's style.\n"
+            "8. Recognize and acknowledge changes in the user's situation or"
+            " perspectives over time.\n"
+            "9. Leverage memories to provide personalized examples and"
+            " analogies.\n"
+            "10. Recall past challenges or successes to inform current"
+            " problem-solving.\n\n"
+            "## Recall Memories\n"
+            "Recall memories are contextually retrieved based on the current"
+            " conversation:\n{recall_memories}\n\n"
+            "## Instructions\n"
+            "Engage with the user naturally, as a trusted colleague or friend."
+            " There's no need to explicitly mention your memory capabilities."
+            " Instead, seamlessly incorporate your understanding of the user"
+            " into your responses. Be attentive to subtle cues and underlying"
+            " emotions. Adapt your communication style to match the user's"
+            " preferences and current emotional state. Use tools to persist"
+            " information you want to retain in the next conversation. If you"
+            " do call tools, all text preceding the tool call is an internal"
+            " message. Respond AFTER calling the tool, once you have"
+            " confirmation that the tool completed successfully.\n\n",
+        ),
+        ("placeholder", "{messages}"),
+    ]
+)
+
+model = ChatOpenAI(
+    model_name="gpt-4o",
+    api_key=os.getenv("OPENAI_API_KEY")
+)
+model_with_tools = model.bind_tools(tools)
+
+tokenizer = tiktoken.encoding_for_model("gpt-4o")
+
+
+def agent(state: State) -> State:
+    """Process the current state and generate a response using the LLM.
+
+    Args:
+        state (schemas.State): The current state of the conversation.
+
+    Returns:
+        schemas.State: The updated state with the agent's response.
+    """
+    bound = prompt | model_with_tools
+    recall_str = (
+        "<recall_memory>\n" + "\n".join(state["recall_memories"]) + "\n</recall_memory>"
+    )
+    prediction = bound.invoke(
+        {
+            "messages": state["messages"],
+            "recall_memories": recall_str,
+        }
+    )
+    return {
+        "messages": [prediction],
+    }
+
+
+def load_memories(state: State, config: RunnableConfig) -> State:
+    """Load memories for the current conversation.
+
+    Args:
+        state (schemas.State): The current state of the conversation.
+        config (RunnableConfig): The runtime configuration for the agent.
+
+    Returns:
+        State: The updated state with loaded memories.
+    """
+    convo_str = get_buffer_string(state["messages"])
+    convo_str = tokenizer.decode(tokenizer.encode(convo_str)[:2048])
+    recall_memories = search_recall_memories.invoke(convo_str, config)
+    return {
+        "recall_memories": recall_memories,
+    }
+
+
+def route_tools(state: State):
+    """Determine whether to use tools or end the conversation based on the last message.
+
+    Args:
+        state (schemas.State): The current state of the conversation.
+
+    Returns:
+        Literal["tools", "__end__"]: The next step in the graph.
+    """
+    msg = state["messages"][-1]
+    if msg.tool_calls:
+        return "tools"
+
+    return END
+
+# Create the graph and add nodes
+builder = StateGraph(State)
+builder.add_node(load_memories)
+builder.add_node(agent)
+builder.add_node("tools", ToolNode(tools))
+
+# Add edges to the graph
+builder.add_edge(START, "load_memories")
+builder.add_edge("load_memories", "agent")
+builder.add_conditional_edges("agent", route_tools, ["tools", END])
+builder.add_edge("tools", "agent")
+
+# Compile the graph
+memory = MemorySaver()
+graph = builder.compile(checkpointer=memory)
+
+from IPython.display import Image, display
+
+display(Image(graph.get_graph().draw_mermaid_png()))
+
+def pretty_print_stream_chunk(chunk):
+    for node, updates in chunk.items():
+        print(f"Update from node: {node}")
+        if "messages" in updates:
+            updates["messages"][-1].pretty_print()
+        else:
+            print(updates)
+
+        print("\n")
+
+for chunk in graph.stream({"messages": [("user", "my name is John")]}, config=config):
+    pretty_print_stream_chunk(chunk)
+
