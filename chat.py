@@ -9,15 +9,15 @@ from dotenv import load_dotenv
 
 import tiktoken
 from langchain_core.documents import Document
-from langchain_core.embeddings import Embeddings
+# from langchain_core.embeddings import Embeddings  # Not used in this implementation
 from langchain_core.messages import get_buffer_string
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
-from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_chroma import Chroma
 from langchain_openai import ChatOpenAI
 from langchain_openai.embeddings import OpenAIEmbeddings
-from langchain_tavily import TavilySearch
+# from langchain_tavily import TavilySearch  # Not used in this implementation
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
@@ -30,7 +30,10 @@ def _set_env(var: str):
 
 _set_env("OPENAI_API_KEY")
 
-recall_vector_store = InMemoryVectorStore(OpenAIEmbeddings(api_key=os.getenv("OPENAI_API_KEY")))
+recall_vector_store = Chroma(
+    persist_directory="./memory_db",
+    embedding_function=OpenAIEmbeddings(api_key=os.getenv("OPENAI_API_KEY"))
+)
 
 
 def get_user_id(config: RunnableConfig) -> str:
@@ -69,11 +72,8 @@ def search_recall_memories(query: str, config: RunnableConfig) -> List[str]:
     """Search for relevant memories."""
     user_id = get_user_id(config)
 
-    def _filter_function(doc: Document) -> bool:
-        return doc.metadata.get("user_id") == user_id
-
     documents = recall_vector_store.similarity_search(
-        query, k=3, filter=_filter_function
+        query, k=3, filter={"user_id": user_id}
     )
     return [document.page_content for document in documents]
 
@@ -215,20 +215,59 @@ builder.add_edge("tools", "agent")
 memory = MemorySaver()
 graph = builder.compile(checkpointer=memory)
 
-from IPython.display import Image, display
+# Graph compiled and ready for interactive chat
 
-display(Image(graph.get_graph().draw_mermaid_png()))
+# NOTE: we're specifying `user_id` to save memories for a given user
+config = {"configurable": {"user_id": "1", "thread_id": "1"}}
 
-def pretty_print_stream_chunk(chunk):
-    for node, updates in chunk.items():
-        print(f"Update from node: {node}")
-        if "messages" in updates:
-            updates["messages"][-1].pretty_print()
-        else:
-            print(updates)
+def interactive_chat():
+    """Interactive chat loop with memory capabilities."""
+    print("AI Assistant with Memory")
+    
+    while True:
+        # Get user input
+        try:
+            user_input = input("\n😊 You: ").strip()
+        except KeyboardInterrupt:
+            print("\n\n👋 Goodbye!")
+            break
+        
+        # Check for exit commands
+        if user_input.lower() in ['quit', 'exit', 'bye', 'q']:
+            print("👋 Goodbye!")
+            break
+        
+        # Skip empty input
+        if not user_input:
+            continue
+            
+        print(f"\n AI: ", end="", flush=True)
+        
+        # Stream the conversation
+        ai_response = ""
+        for chunk in graph.stream({"messages": [("user", user_input)]}, config=config):
+            for node, updates in chunk.items():
+                if "messages" in updates:
+                    message = updates["messages"][-1]
+                    # Only print AI messages (not tool messages)
+                    if hasattr(message, 'content') and message.content:
+                        # Print the content if it's the final AI response
+                        if not hasattr(message, 'tool_calls') or not message.tool_calls:
+                            ai_response = message.content
+                            print(ai_response)
+                        # If it has tool calls, it's an intermediate message
+                        elif message.tool_calls:
+                            print("🧠 [Processing and saving memory...]", end=" ", flush=True)
+                    elif hasattr(message, 'content') and not message.content:
+                        # This is likely the final response after tool usage
+                        pass
+                else:
+                    # Handle memory loading updates
+                    if node == "load_memories" and "recall_memories" in updates:
+                        memories = updates["recall_memories"]
+                        if memories:
+                            print(f"💭 [Loaded {len(memories)} memories]", end=" ", flush=True)
 
-        print("\n")
-
-for chunk in graph.stream({"messages": [("user", "my name is John")]}, config=config):
-    pretty_print_stream_chunk(chunk)
+if __name__ == "__main__":
+    interactive_chat()
 
