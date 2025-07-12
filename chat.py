@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 
 import tiktoken
 from langchain_core.documents import Document
-# from langchain_core.embeddings import Embeddings  # Not used in this implementation
 from langchain_core.messages import get_buffer_string
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
@@ -17,7 +16,7 @@ from langchain_core.tools import tool
 from langchain_chroma import Chroma
 from langchain_openai import ChatOpenAI
 from langchain_openai.embeddings import OpenAIEmbeddings
-# from langchain_tavily import TavilySearch  # Not used in this implementation
+from langchain_tavily import TavilySearch
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
@@ -29,6 +28,7 @@ def _set_env(var: str):
         os.environ[var] = getpass.getpass(f"{var}: ")
 
 _set_env("OPENAI_API_KEY")
+_set_env("TAVILY_API_KEY")
 
 recall_vector_store = Chroma(
     persist_directory="./memory_db",
@@ -77,12 +77,12 @@ def search_recall_memories(query: str, config: RunnableConfig) -> List[str]:
     )
     return [document.page_content for document in documents]
 
-tools = [save_recall_memory, search_recall_memories]
+search = TavilySearch(max_results=3)
+tools = [save_recall_memory, search_recall_memories, search]
 
 class State(MessagesState):
     recall_memories: List[str]
 
-# Define the prompt template for the agent
 prompt = ChatPromptTemplate.from_messages(
     [
         (
@@ -177,7 +177,16 @@ def load_memories(state: State, config: RunnableConfig) -> State:
         State: The updated state with loaded memories.
     """
     convo_str = get_buffer_string(state["messages"])
-    convo_str = tokenizer.decode(tokenizer.encode(convo_str)[:2048])
+    try:
+        tokens = tokenizer.encode(convo_str)
+        if len(tokens) > 2048:
+            truncated_tokens = tokens[:2048]
+            convo_str = tokenizer.decode(truncated_tokens)
+        convo_str = convo_str.encode('utf-8', errors='ignore').decode('utf-8')
+    except Exception as e:
+        convo_str = convo_str[:4000]
+        convo_str = convo_str.encode('utf-8', errors='ignore').decode('utf-8')
+    
     recall_memories = search_recall_memories.invoke(convo_str, config)
     return {
         "recall_memories": recall_memories,
@@ -199,25 +208,19 @@ def route_tools(state: State):
 
     return END
 
-# Create the graph and add nodes
 builder = StateGraph(State)
 builder.add_node(load_memories)
 builder.add_node(agent)
 builder.add_node("tools", ToolNode(tools))
 
-# Add edges to the graph
 builder.add_edge(START, "load_memories")
 builder.add_edge("load_memories", "agent")
 builder.add_conditional_edges("agent", route_tools, ["tools", END])
 builder.add_edge("tools", "agent")
 
-# Compile the graph
 memory = MemorySaver()
 graph = builder.compile(checkpointer=memory)
 
-# Graph compiled and ready for interactive chat
-
-# NOTE: we're specifying `user_id` to save memories for a given user
 config = {"configurable": {"user_id": "1", "thread_id": "1"}}
 
 def interactive_chat():
@@ -225,48 +228,36 @@ def interactive_chat():
     print("AI Assistant with Memory")
     
     while True:
-        # Get user input
         try:
             user_input = input("\n😊 You: ").strip()
         except KeyboardInterrupt:
             print("\n\n👋 Goodbye!")
             break
         
-        # Check for exit commands
         if user_input.lower() in ['quit', 'exit', 'bye', 'q']:
             print("👋 Goodbye!")
             break
         
-        # Skip empty input
         if not user_input:
             continue
             
         print(f"\n AI: ", end="", flush=True)
         
-        # Stream the conversation
-        ai_response = ""
+        
         for chunk in graph.stream({"messages": [("user", user_input)]}, config=config):
             for node, updates in chunk.items():
                 if "messages" in updates:
                     message = updates["messages"][-1]
-                    # Only print AI messages (not tool messages)
-                    if hasattr(message, 'content') and message.content:
-                        # Print the content if it's the final AI response
-                        if not hasattr(message, 'tool_calls') or not message.tool_calls:
-                            ai_response = message.content
-                            print(ai_response)
-                        # If it has tool calls, it's an intermediate message
-                        elif message.tool_calls:
-                            print("🧠 [Processing and saving memory...]", end=" ", flush=True)
-                    elif hasattr(message, 'content') and not message.content:
-                        # This is likely the final response after tool usage
-                        pass
+                    
+                    if node == "agent":
+                        if hasattr(message, 'content') and message.content:
+                            print(message.content)
+                    
+                elif node == "tools":
+                    continue
                 else:
-                    # Handle memory loading updates
                     if node == "load_memories" and "recall_memories" in updates:
                         memories = updates["recall_memories"]
-                        if memories:
-                            print(f"💭 [Loaded {len(memories)} memories]", end=" ", flush=True)
 
 if __name__ == "__main__":
     interactive_chat()
