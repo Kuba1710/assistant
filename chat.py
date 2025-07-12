@@ -6,7 +6,7 @@ from typing import List, Literal, Optional
 import uuid
 from typing_extensions import TypedDict
 from dotenv import load_dotenv
-
+import spotipy
 import tiktoken
 from langchain_core.documents import Document
 from langchain_core.messages import get_buffer_string
@@ -20,20 +20,36 @@ from langchain_tavily import TavilySearch
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
+from spotipy.oauth2 import SpotifyOAuth
 
 load_dotenv()
-
-def _set_env(var: str):
-    if not os.environ.get(var):
-        os.environ[var] = getpass.getpass(f"{var}: ")
-
-_set_env("OPENAI_API_KEY")
-_set_env("TAVILY_API_KEY")
 
 recall_vector_store = Chroma(
     persist_directory="./memory_db",
     embedding_function=OpenAIEmbeddings(api_key=os.getenv("OPENAI_API_KEY"))
 )
+
+def get_spotify_client():
+    """Get Spotify client with proper authentication handling."""
+    try:
+        # Try to use existing token first
+        auth_manager = SpotifyOAuth(
+            client_id=os.getenv("SPOTIFY_CLIENT_ID"),
+            client_secret=os.getenv("SPOTIFY_CLIENT_SECRET"),
+            redirect_uri="http://127.0.0.1:8000/callback",
+            scope="user-read-playback-state,user-modify-playback-state,playlist-read-private",
+            cache_path=".spotify_cache",
+            open_browser=False
+        )
+
+        if os.path.exists(".spotify_cache"):
+            return spotipy.Spotify(auth_manager=auth_manager)
+        else:
+            return None
+    except Exception as e:
+        return None
+
+sp = get_spotify_client()
 
 
 def get_user_id(config: RunnableConfig) -> str:
@@ -77,8 +93,41 @@ def search_recall_memories(query: str, config: RunnableConfig) -> List[str]:
     )
     return [document.page_content for document in documents]
 
-search = TavilySearch(max_results=3)
-tools = [save_recall_memory, search_recall_memories, search]
+@tool
+def spotify(query: str) -> str:
+    """Search and play a song on Spotify."""
+    try:
+        results = sp.search(q=query, type="track", limit=1)
+        
+        if not results["tracks"]["items"]:
+            return f"No tracks found for '{query}'"
+        
+        track = results["tracks"]["items"][0]
+        track_uri = track["uri"]
+        track_name = track["name"]
+        artist_name = track["artists"][0]["name"]
+        
+        sp.start_playback(uris=[track_uri])
+        return f"Now playing: {track_name} by {artist_name}"
+        
+    except Exception as e:
+        return f"Error playing song: {str(e)}. Make sure Spotify is open and you have an active device."
+
+tavily_search = TavilySearch(max_results=3, api_key=os.getenv("TAVILY_API_KEY"))
+
+@tool
+def search_internet(query: str) -> str:
+    """Search the internet for current information about any topic."""
+    try:
+        results = tavily_search.run(query)
+        if results:
+            return results
+        else:
+            return f"No results found for '{query}'"
+    except Exception as e:
+        return f"Error searching the internet: {str(e)}. Please check your TAVILY_API_KEY in the .env file."
+
+tools = [save_recall_memory, search_recall_memories, search_internet, spotify]
 
 class State(MessagesState):
     recall_memories: List[str]
