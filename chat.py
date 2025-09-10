@@ -21,6 +21,9 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from spotipy.oauth2 import SpotifyOAuth
+from todoist_api_python.api import TodoistAPI
+from datetime import datetime, timedelta
+import re
 
 load_dotenv()
 
@@ -32,7 +35,6 @@ recall_vector_store = Chroma(
 def get_spotify_client():
     """Get Spotify client with proper authentication handling."""
     try:
-        # Try to use existing token first
         auth_manager = SpotifyOAuth(
             client_id=os.getenv("SPOTIFY_CLIENT_ID"),
             client_secret=os.getenv("SPOTIFY_CLIENT_SECRET"),
@@ -50,6 +52,19 @@ def get_spotify_client():
         return None
 
 sp = get_spotify_client()
+
+def get_todoist_client():
+    """Get Todoist client with proper authentication handling."""
+    try:
+        api_key = os.getenv("TODOIST_API_KEY")
+        if api_key:
+            return TodoistAPI(api_key)
+        else:
+            return None
+    except Exception as e:
+        return None
+
+todoist = get_todoist_client()
 
 
 def get_user_id(config: RunnableConfig) -> str:
@@ -127,7 +142,79 @@ def search_internet(query: str) -> str:
     except Exception as e:
         return f"Error searching the internet: {str(e)}. Please check your TAVILY_API_KEY in the .env file."
 
-tools = [save_recall_memory, search_recall_memories, search_internet, spotify]
+@tool
+def list_todoist_projects() -> str:
+    """List all available Todoist projects."""
+    if not todoist:
+        return "Todoist is not configured. Please add your TODOIST_API_KEY to the .env file."
+    
+    try:
+        projects_response = todoist.get_projects()
+        projects_list = list(projects_response)
+        projects = projects_list[0] if projects_list else []
+        if not projects:
+            return "No projects found in your Todoist account."
+        
+        project_list = "\n".join([f"- {project.name} (ID: {project.id})" for project in projects])
+        return f"Available Todoist projects:\n{project_list}"
+        
+    except Exception as e:
+        return f"Error fetching Todoist projects: {str(e)}"
+
+@tool
+def add_todoist_task(task_content: str, project_name: str = "Inbox", due_date: str = None) -> str:
+    """Add a task to Todoist with optional project and due date.
+    
+    Args:
+        task_content: The task description
+        project_name: Name of the project (default: "Inbox")
+        due_date: Due date in natural language (e.g., "tomorrow", "today", "next week", "2024-12-25")
+    """
+    if not todoist:
+        return "Todoist is not configured. Please add your TODOIST_API_KEY to the .env file."
+    
+    try:
+
+        projects_response = todoist.get_projects()
+        projects_list = list(projects_response)
+        projects = projects_list[0] if projects_list else []
+        project_id = None
+        
+        for project in projects:
+            if project.name.lower() == project_name.lower():
+                project_id = project.id
+                break
+            elif project_name.lower() in project.name.lower():
+                project_id = project.id
+                break
+        
+        if project_id is None and project_name.lower() != "inbox":
+            available = ', '.join([p.name for p in projects])
+            return f"Project '{project_name}' not found. Available projects: {available}"
+        
+        due_string = due_date.strip() if due_date else None
+        
+        task_data = {
+            "content": task_content,
+        }
+        
+        if project_id is not None:
+            task_data["project_id"] = project_id
+        
+        if due_string:
+            task_data["due_string"] = due_string
+        
+        task = todoist.add_task(**task_data)
+        
+        project_display = project_name if project_id else "Inbox"
+        due_display = f" (due: {due_string})" if due_string else ""
+        
+        return f"✅ Task added successfully to '{project_display}': {task_content}{due_display}"
+        
+    except Exception as e:
+        return f"Error adding task to Todoist: {str(e)}"
+
+tools = [save_recall_memory, search_recall_memories, search_internet, spotify, add_todoist_task, list_todoist_projects]
 
 class State(MessagesState):
     recall_memories: List[str]
@@ -166,6 +253,16 @@ prompt = ChatPromptTemplate.from_messages(
             "## Recall Memories\n"
             "Recall memories are contextually retrieved based on the current"
             " conversation:\n{recall_memories}\n\n"
+            "## Available Tools\n"
+            "You have access to several tools:\n"
+            "- Memory tools: save and search personal memories\n"
+            "- Spotify: search and play music\n"
+            "- Internet search: get current information\n"
+            "- Todoist: add tasks to projects with due dates\n\n"
+            "For Todoist tasks, you can understand natural language requests like:\n"
+            "- 'Tomorrow I need to clean my home' -> add task 'clean my home' to 'home' project for tomorrow\n"
+            "- 'Add buy groceries to my shopping list for Friday' -> add to shopping project for Friday\n"
+            "- 'Remind me to call mom next week' -> add task with due date next week\n\n"
             "## Instructions\n"
             "Engage with the user naturally, as a trusted colleague or friend."
             " There's no need to explicitly mention your memory capabilities."
